@@ -10,6 +10,7 @@ from rich.table import Table
 from rich.panel import Panel
 from rich import box
 from tenacity import retry, stop_after_attempt, wait_exponential
+import uuid, json, base64
 
 console = Console()
 bt.trace()
@@ -17,6 +18,12 @@ bt.trace()
 # Global history variables for the /history command.
 last_history_snapshot = None
 accumulated_history = []
+
+# Global dictionaries for an open bot.
+# TODO: Replace with persistent data store for PROD
+USER_WALLETS = {}   # Maps Telegram user_id -> wallet address (public only)
+USER_PREFERENCES = {}   # Maps Telegram user_id -> dict of preferences (e.g. custom multipliers)
+PENDING_TRADES = {}     # Maps trade_id -> unsigned payload (to be later signed and submitted)
 
 # List of endpoints to try
 ENDPOINTS = [
@@ -173,7 +180,10 @@ async def handle_telegram_command(message, wallet, config):
         return
 
     if cmd == "/balance":
-        # Create a temporary subtensor connection and retrieve portfolio info.
+        if chat_id not in USER_WALLETS:
+            send_telegram_message("Please register your wallet first with /register <wallet_address>.", config, chat_id)
+            return
+        user_wallet_address = USER_WALLETS[chat_id]
         try:
             sub = await get_working_subtensor()
         except Exception as e:
@@ -181,12 +191,14 @@ async def handle_telegram_command(message, wallet, config):
             return
         try:
             current_block = await sub.get_current_block()
-            stake_info = await sub.get_stake_for_coldkey(coldkey_ss58=wallet.coldkeypub.ss58_address)
-            wallet_balance = float(await sub.get_balance(wallet.coldkey.ss58_address))
+            # Use user's wallet address for stake queries
+            stake_info = await sub.get_stake_for_coldkey(coldkey_ss58=user_wallet_address)
+            wallet_balance = float(await sub.get_balance(user_wallet_address))
         except Exception as e:
             send_telegram_message(f"Error retrieving balance info: {e}", config, chat_id)
             await sub.close()
             return
+
         msg_lines = []
         msg_lines.append("*Portfolio Balance Info:*")
         msg_lines.append(f"• Wallet Balance: `{wallet_balance:.4f}` TAO")
@@ -405,22 +417,47 @@ async def handle_telegram_command(message, wallet, config):
         if len(parts) < 3:
             send_telegram_message("Usage: /buy <netuid> <amount>", config, chat_id)
             return
+
         try:
+            netuid = int(parts[1])
             amount = float(parts[2])
         except ValueError:
-            send_telegram_message("Usage: /buy <netuid> <amount> (amount must be a number)", config, chat_id)
+            send_telegram_message("Parameters must be numeric. Usage: /buy <netuid> <amount>", config, chat_id)
             return
-        try:
-            sub = await get_working_subtensor()
-        except Exception as e:
-            send_telegram_message(f"Error initializing subtensor connection: {e}", config, chat_id)
+
+        if chat_id not in USER_WALLETS:
+            send_telegram_message("Please register your wallet first using /register <wallet_address>.", config, chat_id)
             return
-        try:
-            await stake_on_subnet(sub, wallet, config.validator, netuid, amount)
-            send_telegram_message(f"Bought {amount:.4f} TAO in subnet {netuid}.", config, chat_id)
-        except Exception as e:
-            send_telegram_message(f"Error buying in subnet {netuid}: {e}", config, chat_id)
-        await sub.close()
+
+        user_wallet_address = USER_WALLETS[chat_id]
+
+        # Build an unsigned payload for a buy transaction.
+        payload = {
+            "action": "buy",
+            "wallet": user_wallet_address,
+            "netuid": netuid,
+            "amount": amount,
+            "timestamp": int(time.time()),
+            "nonce": str(uuid.uuid4())
+        }
+        payload_str = json.dumps(payload)
+        trade_id = str(uuid.uuid4())
+        PENDING_TRADES[trade_id] = payload_str
+
+        # Generate a deep link URL to your external signing service.
+        # The unsigned payload is base64-encoded.
+        encoded_payload = base64.urlsafe_b64encode(payload_str.encode()).decode()
+        deep_link = f"http://ec2-51-21-77-63.eu-north-1.compute.amazonaws.com:8080/sign.html?trade_id={trade_id}&payload={encoded_payload}"
+        
+        # Optionally, create an inline keyboard button with URL.
+        # For now, we simply send text containing the link.
+        message_text = (
+            "To proceed with your buy transaction, please click the link below:\n"
+            f"{deep_link}\n\n"
+            "This will open your browser/mobile wallet and trigger the wallet pop-up for signing."
+        )
+        send_telegram_message(message_text, config, chat_id)
+        return
 
     elif cmd == "/amount":
         try:
@@ -430,6 +467,50 @@ async def handle_telegram_command(message, wallet, config):
             return
         config.stake_amount = new_amount
         send_telegram_message(f"New stake amount is: `{new_amount:.4f}` TAO", config, chat_id)
+
+    # New: user registration command.
+    if cmd == "/register":
+        if len(parts) < 2:
+            send_telegram_message("Usage: /register <wallet_address>", config, chat_id)
+            return
+        wallet_address = parts[1]
+        # Optionally, validate the wallet address format.
+        USER_WALLETS[chat_id] = wallet_address
+        # Initialize default preferences for the user.
+        USER_PREFERENCES[chat_id] = config.preferences.copy() if config.preferences else {}
+        send_telegram_message(f"Wallet {wallet_address} registered successfully.", config, chat_id)
+        return
+
+    # -----------------------------------------------
+    # Modified /submit command for receiving the signed transaction
+    if cmd == "/submit":
+        if len(parts) < 3:
+            send_telegram_message("Usage: /submit <trade_id> <signed_tx>", config, chat_id)
+            return
+
+        trade_id = parts[1]
+        signed_tx = parts[2]  # signed_tx is expected in a format such as hex or base64
+
+        if trade_id not in PENDING_TRADES:
+            send_telegram_message("Invalid or expired trade ID.", config, chat_id)
+            return
+
+        try:
+            sub = await get_working_subtensor()
+        except Exception as e:
+            send_telegram_message(f"Error initializing subtensor connection: {e}", config, chat_id)
+            return
+
+        try:
+            # TODO: Optionally validate that 'signed_tx' corresponds to the unsigned payload in PENDING_TRADES[trade_id].
+            # Broadcast the signed transaction using your substrate client.
+            receipt = await broadcast_transaction(signed_tx, sub)
+            send_telegram_message(f"Transaction broadcast successfully. Receipt:\n{receipt}", config, chat_id)
+            del PENDING_TRADES[trade_id]
+        except Exception as e:
+            send_telegram_message(f"Error broadcasting transaction: {e}", config, chat_id)
+        await sub.close()
+        return
 
 # --- New Helper for Selling (Unstaking) ---
 
