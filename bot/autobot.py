@@ -151,8 +151,8 @@ async def handle_telegram_command(message, wallet, config):
       /boost <netuid>      -- increases the preference for that subnet by 0.1.
       /slash <netuid>      -- decreases the preference for that subnet by 0.1 (min 0.1).
       /exclude <netuid>    -- adds the subnet to the exclude list.
-      /sell <netuid> <amount>   -- sells (unstakes) the specified amount from that subnet.
-      /buy <netuid> <amount>    -- buys (stakes) the specified amount into that subnet.
+      /unstake <netuid> <amount>   -- sells (unstakes) the specified amount from that subnet.
+      /stake <netuid> <amount>    -- buys (stakes) the specified amount into that subnet.
       /amount <value>      -- sets the stake amount to the given value.
       /balance             -- returns a summary of your current portfolio.
       /history             -- returns a history summary since the last /history call.
@@ -212,7 +212,7 @@ async def handle_telegram_command(message, wallet, config):
                 except Exception:
                     stake_amt = 0.0
                 if stake_amt > 0:
-                    msg_lines.append(f"• Subnet `{stake.netuid}`: `{stake_amt:.4f}` TAO")
+                    msg_lines.append(f"• Subnet `{stake.netuid}`: `{stake_amt:.4f}` {stake_info.symbol}")
         else:
             msg_lines.append("No stakes found.")
         reply = "\n".join(msg_lines)
@@ -303,7 +303,7 @@ async def handle_telegram_command(message, wallet, config):
         return
 
     # For commands that require a netuid, parse it.
-    if cmd in ["/info", "/boost", "/slash", "/exclude", "/sell", "/buy"]:
+    if cmd in ["/info", "/boost", "/slash", "/exclude", "/unstake", "/stake"]:
         if len(parts) < 2:
             send_telegram_message("Usage: Command requires a netuid.", config, chat_id)
             return
@@ -364,7 +364,7 @@ async def handle_telegram_command(message, wallet, config):
         reply = (
             f"*Subnet Info for {netuid} ({target.subnet_name}):*\n"
             f"• *Current Price:* `{price:.4f}` TAO\n"
-            f"• *Your Stake:* `{my_stake:.4f}` TAO\n"
+            f"• *Your Stake:* `{my_stake:.4f}` {target.symbol}\n"
             f"• *Current Preference:* `{current_pref:.2f}`\n"
             f"• *Current Block:* `{current_block}`"
         )
@@ -392,14 +392,14 @@ async def handle_telegram_command(message, wallet, config):
         else:
             send_telegram_message(f"Subnet {netuid} is already in the exclude list.", config, chat_id)
 
-    elif cmd == "/sell":
+    elif cmd == "/unstake":
         if len(parts) < 3:
-            send_telegram_message("Usage: /sell <netuid> <amount>", config, chat_id)
+            send_telegram_message("Usage: /unstake <netuid> <amount>", config, chat_id)
             return
         try:
             amount = float(parts[2])
         except ValueError:
-            send_telegram_message("Usage: /sell <netuid> <amount> (amount must be a number)", config, chat_id)
+            send_telegram_message("Usage: /unstake <netuid> <amount> (amount must be a number)", config, chat_id)
             return
         try:
             sub = await get_working_subtensor()
@@ -408,21 +408,21 @@ async def handle_telegram_command(message, wallet, config):
             return
         try:
             await unstake_on_subnet(sub, wallet, config.validator, netuid, amount)
-            send_telegram_message(f"Sold {amount:.4f} TAO from subnet {netuid}.", config, chat_id)
+            send_telegram_message(f"Unstaked {amount:.4f} from subnet {netuid}.", config, chat_id)
         except Exception as e:
-            send_telegram_message(f"Error selling from subnet {netuid}: {e}", config, chat_id)
+            send_telegram_message(f"Error unstaking from subnet {netuid}: {e}", config, chat_id)
         await sub.close()
 
-    elif cmd == "/buy":
+    elif cmd == "/stake":
         if len(parts) < 3:
-            send_telegram_message("Usage: /buy <netuid> <amount>", config, chat_id)
+            send_telegram_message("Usage: /stake <netuid> <amount>", config, chat_id)
             return
 
         try:
             netuid = int(parts[1])
             amount = float(parts[2])
         except ValueError:
-            send_telegram_message("Parameters must be numeric. Usage: /buy <netuid> <amount>", config, chat_id)
+            send_telegram_message("Usage: /stake <netuid> <amount> (amount must be a number)", config, chat_id)
             return
 
         if chat_id not in USER_WALLETS:
@@ -433,7 +433,7 @@ async def handle_telegram_command(message, wallet, config):
 
         # Build an unsigned payload for a buy transaction.
         payload = {
-            "action": "buy",
+            "action": "stake",
             "wallet": user_wallet_address,
             "netuid": netuid,
             "amount": amount,
